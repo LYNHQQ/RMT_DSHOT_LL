@@ -69,10 +69,9 @@ typedef struct {
     uint32_t rx_channel;
     uint32_t tx_mem_index;
     uint32_t rx_mem_index;
-    volatile bool tx_done;
     volatile bool rx_done;
+    volatile bool rx_error;
     volatile uint32_t rx_symbol_count;
-    rmt_symbol_word_t rx_symbols[SOC_RMT_MEM_WORDS_PER_CHANNEL];
 } bshot_rmt_channel_t;
 
 typedef struct {
@@ -202,21 +201,21 @@ static bool bshot_is_erpm_frame(uint16_t raw_12bit)
     return prefix == 0x00 || (prefix & 0x01U) != 0;
 }
 
-static bool bshot_decode_reply(const bshot_rmt_channel_t *channel, bshot_reply_t *reply)
+static bool bshot_decode_reply_symbols(const rmt_symbol_word_t *symbols, uint32_t symbol_count, bshot_reply_t *reply)
 {
     uint32_t encoded = 0;
     uint32_t bit_count = 0;
 
     memset(reply, 0, sizeof(*reply));
-    if (channel->rx_symbol_count == 0) {
+    if (symbol_count == 0) {
         return false;
     }
-    if (channel->rx_symbols[0].duration0 == 0 || channel->rx_symbols[0].level0 != 0) {
+    if (symbols[0].duration0 == 0 || symbols[0].level0 != 0) {
         return false;
     }
 
-    for (uint32_t i = 0; i < channel->rx_symbol_count && i < SOC_RMT_MEM_WORDS_PER_CHANNEL; i++) {
-        const rmt_symbol_word_t *symbol = &channel->rx_symbols[i];
+    for (uint32_t i = 0; i < symbol_count && i < SOC_RMT_MEM_WORDS_PER_CHANNEL; i++) {
+        const rmt_symbol_word_t *symbol = &symbols[i];
         uint16_t durations[2] = {symbol->duration0, symbol->duration1};
         uint8_t levels[2] = {symbol->level0, symbol->level1};
 
@@ -266,6 +265,24 @@ finish:
     }
 
     return true;
+}
+
+static bool bshot_read_reply_from_hw(const bshot_rmt_channel_t *channel, bshot_reply_t *reply)
+{
+    bool ok;
+    const rmt_symbol_word_t *rx_mem = bshot_rx_mem_base(channel);
+
+    portENTER_CRITICAL(&s_rmt_spinlock);
+    rmt_ll_rx_set_mem_owner(&RMT, channel->rx_channel, RMT_LL_MEM_OWNER_SW);
+    portEXIT_CRITICAL(&s_rmt_spinlock);
+
+    ok = bshot_decode_reply_symbols(rx_mem, channel->rx_symbol_count, reply);
+
+    portENTER_CRITICAL(&s_rmt_spinlock);
+    rmt_ll_rx_set_mem_owner(&RMT, channel->rx_channel, RMT_LL_MEM_OWNER_HW);
+    portEXIT_CRITICAL(&s_rmt_spinlock);
+
+    return ok;
 }
 
 static void bshot_compute_timing(void)
@@ -340,7 +357,6 @@ static void IRAM_ATTR bshot_prepare_rx_from_isr(const bshot_rmt_channel_t *chann
     rmt_ll_clear_interrupt_status(
         &RMT,
         RMT_LL_EVENT_RX_DONE(channel->rx_channel) |
-        RMT_LL_EVENT_RX_THRES(channel->rx_channel) |
         RMT_LL_EVENT_RX_ERROR(channel->rx_channel)
     );
     rmt_ll_rx_enable(&RMT, channel->rx_channel, true);
@@ -358,14 +374,25 @@ static void IRAM_ATTR bshot_rmt_isr(void *arg)
 
         if (tx_status & RMT_LL_EVENT_TX_DONE(channel->tx_channel)) {
             rmt_ll_clear_interrupt_status(&RMT, RMT_LL_EVENT_TX_DONE(channel->tx_channel));
-            channel->tx_done = true;
 
             portENTER_CRITICAL_ISR(&s_rmt_spinlock);
             bshot_prepare_rx_from_isr(channel);
             portEXIT_CRITICAL_ISR(&s_rmt_spinlock);
         }
 
-        if (rx_status & RMT_LL_EVENT_RX_DONE(channel->rx_channel)) {
+        if (rx_status & RMT_LL_EVENT_RX_ERROR(channel->rx_channel)) {
+            rmt_ll_clear_interrupt_status(&RMT, RMT_LL_EVENT_RX_ERROR(channel->rx_channel));
+            portENTER_CRITICAL_ISR(&s_rmt_spinlock);
+            rmt_ll_rx_enable(&RMT, channel->rx_channel, false);
+            portEXIT_CRITICAL_ISR(&s_rmt_spinlock);
+
+            channel->rx_symbol_count = 0;
+            channel->rx_error = true;
+            channel->rx_done = true;
+            if (s_bshot_ctx.worker_task != NULL) {
+                vTaskNotifyGiveFromISR(s_bshot_ctx.worker_task, &task_woken);
+            }
+        } else if (rx_status & RMT_LL_EVENT_RX_DONE(channel->rx_channel)) {
             uint32_t symbol_count;
 
             rmt_ll_clear_interrupt_status(&RMT, RMT_LL_EVENT_RX_DONE(channel->rx_channel));
@@ -375,12 +402,10 @@ static void IRAM_ATTR bshot_rmt_isr(void *arg)
             if (symbol_count > SOC_RMT_MEM_WORDS_PER_CHANNEL) {
                 symbol_count = SOC_RMT_MEM_WORDS_PER_CHANNEL;
             }
-            rmt_ll_rx_set_mem_owner(&RMT, channel->rx_channel, RMT_LL_MEM_OWNER_SW);
-            memcpy(channel->rx_symbols, bshot_rx_mem_base(channel), symbol_count * sizeof(rmt_symbol_word_t));
-            rmt_ll_rx_set_mem_owner(&RMT, channel->rx_channel, RMT_LL_MEM_OWNER_HW);
             portEXIT_CRITICAL_ISR(&s_rmt_spinlock);
 
             channel->rx_symbol_count = symbol_count;
+            channel->rx_error = false;
             channel->rx_done = true;
             if (s_bshot_ctx.worker_task != NULL) {
                 vTaskNotifyGiveFromISR(s_bshot_ctx.worker_task, &task_woken);
@@ -417,10 +442,7 @@ static uint32_t bshot_rmt_interrupt_mask(void)
         const bshot_rmt_channel_t *channel = &s_bshot_ctx.channels[i];
 
         mask |= RMT_LL_EVENT_TX_DONE(channel->tx_channel);
-        mask |= RMT_LL_EVENT_TX_THRES(channel->tx_channel);
-        mask |= RMT_LL_EVENT_TX_ERROR(channel->tx_channel);
         mask |= RMT_LL_EVENT_RX_DONE(channel->rx_channel);
-        mask |= RMT_LL_EVENT_RX_THRES(channel->rx_channel);
         mask |= RMT_LL_EVENT_RX_ERROR(channel->rx_channel);
     }
 
@@ -470,8 +492,8 @@ static void bshot_rmt_hw_init(void)
         rmt_ll_rx_set_channel_clock_div(&RMT, channel->rx_channel, BDSHOT_RMT_CHANNEL_CLK_DIV);
 
         rmt_ll_tx_set_mem_blocks(&RMT, channel->tx_channel, 1);
-        rmt_ll_tx_set_limit(&RMT, channel->tx_channel, SOC_RMT_MEM_WORDS_PER_CHANNEL / 2U);
-        rmt_ll_tx_enable_wrap(&RMT, channel->tx_channel, true);
+        rmt_ll_tx_set_limit(&RMT, channel->tx_channel, SOC_RMT_MEM_WORDS_PER_CHANNEL);
+        rmt_ll_tx_enable_wrap(&RMT, channel->tx_channel, false);
         rmt_ll_tx_enable_carrier_modulation(&RMT, channel->tx_channel, false);
         rmt_ll_tx_fix_idle_level(&RMT, channel->tx_channel, 1, true);
 
@@ -480,8 +502,8 @@ static void bshot_rmt_hw_init(void)
         rmt_ll_rx_enable_filter(&RMT, channel->rx_channel, false);
         rmt_ll_rx_set_idle_thres(&RMT, channel->rx_channel, s_bshot_timing.rx_idle_ticks);
 #if SOC_RMT_SUPPORT_RX_PINGPONG
-        rmt_ll_rx_set_limit(&RMT, channel->rx_channel, SOC_RMT_MEM_WORDS_PER_CHANNEL / 2U);
-        rmt_ll_rx_enable_wrap(&RMT, channel->rx_channel, true);
+        rmt_ll_rx_set_limit(&RMT, channel->rx_channel, SOC_RMT_MEM_WORDS_PER_CHANNEL);
+        rmt_ll_rx_enable_wrap(&RMT, channel->rx_channel, false);
 #endif
 #if SOC_RMT_SUPPORT_RX_DEMODULATION
         rmt_ll_rx_enable_carrier_demodulation(&RMT, channel->rx_channel, false);
@@ -509,10 +531,9 @@ static void bshot_start_transceive(const uint16_t values[BDSHOT_CHANNEL_COUNT], 
         bshot_rmt_channel_t *channel = &s_bshot_ctx.channels[i];
         uint16_t frame = bshot_make_frame(values[i], request_telemetry);
 
-        channel->tx_done = false;
         channel->rx_done = false;
+        channel->rx_error = false;
         channel->rx_symbol_count = 0;
-        memset(channel->rx_symbols, 0, sizeof(channel->rx_symbols));
         bshot_fill_tx_symbols(channel, frame);
         bshot_connect_tx_gpio(channel);
     }
@@ -522,6 +543,7 @@ static void bshot_start_transceive(const uint16_t values[BDSHOT_CHANNEL_COUNT], 
         const bshot_rmt_channel_t *channel = &s_bshot_ctx.channels[i];
 
         rmt_ll_rx_enable(&RMT, channel->rx_channel, false);
+        rmt_ll_rx_set_mem_owner(&RMT, channel->rx_channel, RMT_LL_MEM_OWNER_HW);
         rmt_ll_tx_stop(&RMT, channel->tx_channel);
         rmt_ll_tx_reset_pointer(&RMT, channel->tx_channel);
     }
@@ -543,12 +565,11 @@ static void bshot_stop_rx(const bshot_rmt_channel_t *channel)
     bshot_release_line_to_rx(channel);
 }
 
-static void bshot_wait_for_replies(bshot_reply_t replies[BDSHOT_CHANNEL_COUNT], esp_err_t results[BDSHOT_CHANNEL_COUNT])
+static void bshot_wait_for_replies(esp_err_t results[BDSHOT_CHANNEL_COUNT])
 {
     TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(BDSHOT_WAIT_TIMEOUT_MS);
     uint32_t pending_mask = (1U << BDSHOT_CHANNEL_COUNT) - 1U;
 
-    memset(replies, 0, sizeof(bshot_reply_t) * BDSHOT_CHANNEL_COUNT);
     for (uint32_t i = 0; i < BDSHOT_CHANNEL_COUNT; i++) {
         results[i] = ESP_ERR_TIMEOUT;
     }
@@ -571,8 +592,7 @@ static void bshot_wait_for_replies(bshot_reply_t replies[BDSHOT_CHANNEL_COUNT], 
                 continue;
             }
 
-            bshot_release_line_to_rx(channel);
-            results[i] = bshot_decode_reply(channel, &replies[i]) ? ESP_OK : ESP_ERR_INVALID_RESPONSE;
+            results[i] = channel->rx_error ? ESP_ERR_INVALID_RESPONSE : ESP_OK;
             pending_mask &= ~channel_bit;
         }
     }
@@ -583,6 +603,22 @@ static void bshot_wait_for_replies(bshot_reply_t replies[BDSHOT_CHANNEL_COUNT], 
 
         if ((pending_mask & channel_bit) != 0U) {
             bshot_stop_rx(channel);
+        }
+    }
+}
+
+static void bshot_parse_replies(bshot_reply_t replies[BDSHOT_CHANNEL_COUNT], esp_err_t results[BDSHOT_CHANNEL_COUNT])
+{
+    memset(replies, 0, sizeof(bshot_reply_t) * BDSHOT_CHANNEL_COUNT);
+
+    for (uint32_t i = 0; i < BDSHOT_CHANNEL_COUNT; i++) {
+        const bshot_rmt_channel_t *channel = &s_bshot_ctx.channels[i];
+
+        if (results[i] != ESP_OK) {
+            continue;
+        }
+        if (!bshot_read_reply_from_hw(channel, &replies[i])) {
+            results[i] = ESP_ERR_INVALID_RESPONSE;
         }
     }
 }
@@ -635,9 +671,44 @@ static void bshot_log_results(const bshot_reply_t replies[BDSHOT_CHANNEL_COUNT],
     }
 }
 
+static void bshot_log_edt_enable_step_results(uint32_t step, const bshot_reply_t replies[BDSHOT_CHANNEL_COUNT], const esp_err_t results[BDSHOT_CHANNEL_COUNT])
+{
+    for (uint32_t i = 0; i < BDSHOT_CHANNEL_COUNT; i++) {
+        const bshot_rmt_channel_t *channel = &s_bshot_ctx.channels[i];
+
+        if (results[i] == ESP_OK && replies[i].valid) {
+            if (step == (BDSHOT_EDT_ENABLE_REPEATS - 1U) && !replies[i].is_erpm && replies[i].edt_type == 0x0EU) {
+                ESP_LOGI(
+                    TAG,
+                    "ch=%" PRIu32 " gpio=%d EDT enable acknowledged, version=0x%02X",
+                    channel->index,
+                    channel->gpio_num,
+                    replies[i].edt_value
+                );
+            } else {
+                bshot_log_reply(channel, &replies[i]);
+            }
+        } else {
+            ESP_LOGW(
+                TAG,
+                "ch=%" PRIu32 " gpio=%d EDT enable step %" PRIu32 "/%" PRIu32 " failed: %s",
+                channel->index,
+                channel->gpio_num,
+                step + 1U,
+                (uint32_t)BDSHOT_EDT_ENABLE_REPEATS,
+                esp_err_to_name(results[i])
+            );
+        }
+    }
+}
+
 static void bshot_enable_edt_sequence(void)
 {
     uint16_t commands[BDSHOT_CHANNEL_COUNT];
+    bshot_reply_t replies[BDSHOT_CHANNEL_COUNT];
+    esp_err_t results[BDSHOT_CHANNEL_COUNT];
+    bool have_pending_replies = false;
+    uint32_t pending_step = 0;
 
     bshot_fill_uniform_values(BDSHOT_CMD_EXTENDED_TELEMETRY_ENABLE, commands);
     ESP_LOGI(
@@ -649,46 +720,31 @@ static void bshot_enable_edt_sequence(void)
     );
 
     for (uint32_t step = 0; step < BDSHOT_EDT_ENABLE_REPEATS; step++) {
-        bshot_reply_t replies[BDSHOT_CHANNEL_COUNT];
-        esp_err_t results[BDSHOT_CHANNEL_COUNT];
+        if (have_pending_replies) {
+            bshot_parse_replies(replies, results);
+            bshot_log_edt_enable_step_results(pending_step, replies, results);
+            have_pending_replies = false;
+        }
 
         ulTaskNotifyTake(pdTRUE, 0);
         bshot_start_transceive(commands, false);
-        bshot_wait_for_replies(replies, results);
+        bshot_wait_for_replies(results);
+        pending_step = step;
+        have_pending_replies = true;
+    }
 
-        for (uint32_t i = 0; i < BDSHOT_CHANNEL_COUNT; i++) {
-            const bshot_rmt_channel_t *channel = &s_bshot_ctx.channels[i];
-
-            if (results[i] == ESP_OK && replies[i].valid) {
-                if (step == (BDSHOT_EDT_ENABLE_REPEATS - 1U) && !replies[i].is_erpm && replies[i].edt_type == 0x0EU) {
-                    ESP_LOGI(
-                        TAG,
-                        "ch=%" PRIu32 " gpio=%d EDT enable acknowledged, version=0x%02X",
-                        channel->index,
-                        channel->gpio_num,
-                        replies[i].edt_value
-                    );
-                } else {
-                    bshot_log_reply(channel, &replies[i]);
-                }
-            } else {
-                ESP_LOGW(
-                    TAG,
-                    "ch=%" PRIu32 " gpio=%d EDT enable step %" PRIu32 "/%" PRIu32 " failed: %s",
-                    channel->index,
-                    channel->gpio_num,
-                    step + 1U,
-                    (uint32_t)BDSHOT_EDT_ENABLE_REPEATS,
-                    esp_err_to_name(results[i])
-                );
-            }
-        }
+    if (have_pending_replies) {
+        bshot_parse_replies(replies, results);
+        bshot_log_edt_enable_step_results(pending_step, replies, results);
     }
 }
 
 static void bshot_worker_task(void *arg)
 {
     uint16_t throttle_values[BDSHOT_CHANNEL_COUNT];
+    bshot_reply_t replies[BDSHOT_CHANNEL_COUNT];
+    esp_err_t results[BDSHOT_CHANNEL_COUNT];
+    bool have_pending_replies = false;
 
     (void)arg;
     s_bshot_ctx.worker_task = xTaskGetCurrentTaskHandle();
@@ -697,14 +753,17 @@ static void bshot_worker_task(void *arg)
     bshot_fill_uniform_values(BDSHOT_TEST_THROTTLE, throttle_values);
 
     while (true) {
-        bshot_reply_t replies[BDSHOT_CHANNEL_COUNT];
-        esp_err_t results[BDSHOT_CHANNEL_COUNT];
+        if (have_pending_replies) {
+            vTaskDelay(pdMS_TO_TICKS(BDSHOT_PERIOD_MS));
+            bshot_parse_replies(replies, results);
+            bshot_log_results(replies, results);
+            have_pending_replies = false;
+        }
 
         ulTaskNotifyTake(pdTRUE, 0);
         bshot_start_transceive(throttle_values, BDSHOT_REQUEST_TELEMETRY);
-        bshot_wait_for_replies(replies, results);
-        bshot_log_results(replies, results);
-        vTaskDelay(pdMS_TO_TICKS(BDSHOT_PERIOD_MS));
+        bshot_wait_for_replies(results);
+        have_pending_replies = true;
     }
 }
 
@@ -729,7 +788,7 @@ void app_main(void)
     );
     ESP_LOGI(
         TAG,
-        "RMT interrupt flags=LEVEL3|IRAM, 35us RX idle stop on all channels"
+        "RMT interrupt flags=LEVEL3|IRAM, dedicated TX/RX blocks, parse previous reply before next TX, 35us RX idle stop"
     );
 
     xTaskCreate(
