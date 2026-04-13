@@ -47,8 +47,8 @@ typedef struct {
     uint32_t group_clk_hz;
     uint32_t resolution_hz;
     uint16_t tx_bit_ticks;
-    uint16_t tx_zero_high_ticks;
-    uint16_t tx_one_high_ticks;
+    uint16_t tx_zero_low_ticks;
+    uint16_t tx_one_low_ticks;
     uint16_t reply_bit_ticks;
     uint16_t rx_idle_ticks;
 } bshot_timing_t;
@@ -120,6 +120,18 @@ static uint16_t bshot_make_frame(uint16_t throttle_or_command, bool request_tele
     return (payload << 4) | crc;
 }
 
+static inline rmt_symbol_word_t bshot_make_tx_symbol(bool bit)
+{
+    uint16_t low_ticks = bit ? s_bshot_timing.tx_one_low_ticks : s_bshot_timing.tx_zero_low_ticks;
+
+    return (rmt_symbol_word_t) {
+        .level0 = 0,
+        .duration0 = low_ticks,
+        .level1 = 1,
+        .duration1 = s_bshot_timing.tx_bit_ticks - low_ticks,
+    };
+}
+
 static void bshot_fill_tx_symbols(const bshot_rmt_channel_t *channel, uint16_t frame)
 {
     rmt_symbol_word_t *tx_mem = bshot_tx_mem_base(channel);
@@ -127,16 +139,13 @@ static void bshot_fill_tx_symbols(const bshot_rmt_channel_t *channel, uint16_t f
     memset(tx_mem, 0, sizeof(rmt_symbol_word_t) * SOC_RMT_MEM_WORDS_PER_CHANNEL);
     for (uint32_t i = 0; i < BDSHOT_FRAME_BITS; i++) {
         bool bit = (frame & (1U << (BDSHOT_FRAME_BITS - 1U - i))) != 0;
-        uint16_t high_ticks = bit ? s_bshot_timing.tx_one_high_ticks : s_bshot_timing.tx_zero_high_ticks;
 
-        tx_mem[i].level0 = 0;
-        tx_mem[i].duration0 = high_ticks;
-        tx_mem[i].level1 = 1;
-        tx_mem[i].duration1 = s_bshot_timing.tx_bit_ticks - high_ticks;
+        tx_mem[i] = bshot_make_tx_symbol(bit);
     }
 
-    // Stop after the last active-low pulse and let the line float back high for ESC turnaround.
-    tx_mem[BDSHOT_FRAME_BITS - 1U].duration1 = 0;
+    // Add an explicit high tail so the line returns high before the ESC turnaround window.
+    tx_mem[BDSHOT_FRAME_BITS].level0 = 1;
+    tx_mem[BDSHOT_FRAME_BITS].duration0 = 1;
 }
 
 static uint8_t bshot_decode_gcr_nibble(uint16_t value)
@@ -269,8 +278,8 @@ static void bshot_compute_timing(void)
 
     s_bshot_timing.resolution_hz = s_bshot_timing.group_clk_hz / BDSHOT_RMT_CHANNEL_CLK_DIV;
     s_bshot_timing.tx_bit_ticks = (s_bshot_timing.resolution_hz + (BDSHOT_BAUD_HZ / 2U)) / BDSHOT_BAUD_HZ;
-    s_bshot_timing.tx_zero_high_ticks = (s_bshot_timing.tx_bit_ticks * 3U + 4U) / 8U;
-    s_bshot_timing.tx_one_high_ticks = (s_bshot_timing.tx_bit_ticks * 3U + 2U) / 4U;
+    s_bshot_timing.tx_zero_low_ticks = (s_bshot_timing.tx_bit_ticks * 3U + 4U) / 8U;
+    s_bshot_timing.tx_one_low_ticks = (s_bshot_timing.tx_bit_ticks * 3U + 2U) / 4U;
     s_bshot_timing.reply_bit_ticks = (uint16_t)(((uint64_t)s_bshot_timing.resolution_hz * BDSHOT_REPLY_BIT_NS + 500000000ULL) / 1000000000ULL);
     s_bshot_timing.rx_idle_ticks = (uint16_t)(((uint64_t)s_bshot_timing.resolution_hz * BDSHOT_RX_IDLE_US + 500000ULL) / 1000000ULL);
 }
@@ -712,10 +721,10 @@ void app_main(void)
         s_bshot_ctx.channels[3].gpio_num,
         s_bshot_timing.resolution_hz,
         s_bshot_timing.tx_bit_ticks,
-        s_bshot_timing.tx_zero_high_ticks,
-        s_bshot_timing.tx_bit_ticks - s_bshot_timing.tx_zero_high_ticks,
-        s_bshot_timing.tx_one_high_ticks,
-        s_bshot_timing.tx_bit_ticks - s_bshot_timing.tx_one_high_ticks,
+        s_bshot_timing.tx_zero_low_ticks,
+        s_bshot_timing.tx_bit_ticks - s_bshot_timing.tx_zero_low_ticks,
+        s_bshot_timing.tx_one_low_ticks,
+        s_bshot_timing.tx_bit_ticks - s_bshot_timing.tx_one_low_ticks,
         s_bshot_timing.reply_bit_ticks
     );
     ESP_LOGI(
