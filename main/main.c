@@ -24,6 +24,8 @@
 #define BDSHOT_RMT_GROUP_ID               0
 #define BDSHOT_RMT_GROUP_CLK_DIV          1
 #define BDSHOT_RMT_CHANNEL_CLK_DIV        2
+#define BDSHOT_SYNC_LEADER_CHANNEL        1U
+#define BDSHOT_TX_DONE_ALL_MASK           (RMT_LL_EVENT_TX_DONE(0) | RMT_LL_EVENT_TX_DONE(1) | RMT_LL_EVENT_TX_DONE(2) | RMT_LL_EVENT_TX_DONE(3))
 #define BDSHOT_BAUD_HZ                    600000U
 #define BDSHOT_FRAME_BITS                 16U
 #define BDSHOT_REPLY_BITS                 21U
@@ -372,6 +374,19 @@ static void IRAM_ATTR bshot_rmt_isr(void *arg)
     bshot_rmt_channel_t *ch1 = &s_bshot_ctx.channels[1];
     bshot_rmt_channel_t *ch2 = &s_bshot_ctx.channels[2];
     bshot_rmt_channel_t *ch3 = &s_bshot_ctx.channels[3];
+#if SOC_RMT_SUPPORT_TX_SYNCHRO
+    if ((RMT.int_st.val & RMT_LL_EVENT_TX_DONE(BDSHOT_SYNC_LEADER_CHANNEL)) == 0U) {
+        return;
+    }
+
+    portENTER_CRITICAL_ISR(&s_rmt_spinlock);
+    rmt_ll_clear_interrupt_status(&RMT, BDSHOT_TX_DONE_ALL_MASK);
+    bshot_prepare_rx_from_isr(ch0);
+    bshot_prepare_rx_from_isr(ch1);
+    bshot_prepare_rx_from_isr(ch2);
+    bshot_prepare_rx_from_isr(ch3);
+    portEXIT_CRITICAL_ISR(&s_rmt_spinlock);
+#else
     uint32_t int_st = RMT.int_st.val;
     uint32_t tx_done_clear_mask = 0;
     bool ch0_tx_done = (int_st & RMT_LL_EVENT_TX_DONE(0)) != 0;
@@ -391,7 +406,6 @@ static void IRAM_ATTR bshot_rmt_isr(void *arg)
     if (ch3_tx_done) {
         tx_done_clear_mask |= RMT_LL_EVENT_TX_DONE(3);
     }
-
     if (tx_done_clear_mask == 0U) {
         return;
     }
@@ -411,6 +425,7 @@ static void IRAM_ATTR bshot_rmt_isr(void *arg)
         bshot_prepare_rx_from_isr(ch3);
     }
     portEXIT_CRITICAL_ISR(&s_rmt_spinlock);
+#endif
 }
 
 static void bshot_rmt_gpio_init(void)
@@ -431,11 +446,11 @@ static void bshot_rmt_gpio_init(void)
 
 static uint32_t bshot_rmt_interrupt_mask(void)
 {
-    return
-        RMT_LL_EVENT_TX_DONE(0) |
-        RMT_LL_EVENT_TX_DONE(1) |
-        RMT_LL_EVENT_TX_DONE(2) |
-        RMT_LL_EVENT_TX_DONE(3);
+#if SOC_RMT_SUPPORT_TX_SYNCHRO
+    return RMT_LL_EVENT_TX_DONE(BDSHOT_SYNC_LEADER_CHANNEL);
+#else
+    return BDSHOT_TX_DONE_ALL_MASK;
+#endif
 }
 
 static void bshot_rmt_hw_init(void)
@@ -535,7 +550,7 @@ static void bshot_start_transceive(const uint16_t values[BDSHOT_CHANNEL_COUNT], 
         rmt_ll_tx_reset_pointer(&RMT, channel->tx_channel);
     }
     rmt_ll_tx_reset_channels_clock_div(&RMT, s_bshot_ctx.tx_channel_mask);
-    rmt_ll_clear_interrupt_status(&RMT, interrupt_mask);
+    rmt_ll_clear_interrupt_status(&RMT, interrupt_mask | BDSHOT_TX_DONE_ALL_MASK);
     for (uint32_t i = 0; i < BDSHOT_CHANNEL_COUNT; i++) {
         const bshot_rmt_channel_t *channel = &s_bshot_ctx.channels[i];
 
